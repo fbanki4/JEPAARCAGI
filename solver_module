@@ -1,0 +1,383 @@
+# solver_module.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import copy
+import math
+import random # May need for parameter sampling
+
+# Assuming utils and model are imported correctly
+# Need grid_to_tensor for processing outputs, tensor_to_grid for fallback
+from arc_utils import grid_to_tensor, tensor_to_grid # Keep these imports
+# Import DSL functions if using DSL solver
+from arc_utils import find_objects, execute_dsl_program
+from arc_utils import (
+    dsl_move, dsl_copy, dsl_recolor,
+    dsl_rotate, dsl_flip, dsl_crop_to_content,
+    dsl_scale_object, dsl_rotate_object
+)
+
+
+# --- Simple CNN Decoder ---
+class GridDecoder(nn.Module):
+    """
+    A simple CNN-based decoder to map pooled features back to a grid.
+    Takes a feature vector and reconstructs a grid of specified dimensions.
+    *** NOTE: This decoder needs to be trained separately! ***
+    """
+    def __init__(self, embed_dim=256, target_channels=10, target_size=(30, 30), initial_upsample_factor=4):
+        super().__init__()
+        self.target_h, self.target_w = target_size
+        self.target_channels = target_channels # Number of output colors (0-9)
+        self.initial_upsample_factor = initial_upsample_factor # How much smaller the initial grid is
+
+        # Calculate initial spatial dimensions and channels for the dense layer output
+        # We want to reshape the dense output to (C, H/factor, W/factor)
+        self.init_h = self.target_h // self.initial_upsample_factor
+        self.init_w = self.target_w // self.initial_upsample_factor
+        # Choose an intermediate channel dimension
+        intermediate_channels = 128 # Hyperparameter
+
+        # Project the input embedding to the required number of elements for the initial grid
+        self.dense = nn.Linear(embed_dim, intermediate_channels * self.init_h * self.init_w)
+
+        # Calculate the number of upsampling stages needed
+        # Each ConvTranspose2d with stride=2 doubles the spatial dimensions
+        num_upsample_layers = 0
+        if self.initial_upsample_factor > 1: # Avoid log2(1)
+             num_upsample_layers = int(math.log2(self.initial_upsample_factor))
+             if 2**num_upsample_layers != self.initial_upsample_factor:
+                 print(f"Warning: initial_upsample_factor ({self.initial_upsample_factor}) is not a power of 2. Decoder architecture might be suboptimal.")
+
+        # Build the upsampling layers
+        layers = []
+        current_channels = intermediate_channels
+        for i in range(num_upsample_layers):
+            # Determine output channels for this layer
+            # Example: Halve channels at each stage, but ensure minimum (e.g., 32)
+            out_channels = max(current_channels // 2, 32)
+            layers.append(
+                nn.ConvTranspose2d(
+                    current_channels,
+                    out_channels,
+                    kernel_size=4, # Kernel size that doubles resolution with stride 2, padding 1
+                    stride=2,
+                    padding=1
+                )
+            )
+            layers.append(nn.BatchNorm2d(out_channels)) # Add BatchNorm for stability
+            layers.append(nn.ReLU()) # Activation function
+            current_channels = out_channels
+
+        # Final layer to map to the target number of color channels (logits)
+        layers.append(
+            nn.Conv2d(
+                current_channels,
+                self.target_channels,
+                kernel_size=3, # Use a final 3x3 conv to refine
+                padding=1
+            )
+        )
+        # No activation here, outputting logits for classification
+
+        self.decoder_cnn = nn.Sequential(*layers)
+
+        print(f"--- GridDecoder Initialized ---")
+        print(f"  Input Embed Dim: {embed_dim}")
+        print(f"  Target Size: {target_size}, Target Channels: {target_channels}")
+        print(f"  Initial Upsample Factor: {initial_upsample_factor}, Num Upsample Layers: {num_upsample_layers}")
+
+
+    def forward(self, x):
+        """
+        Forward pass of the decoder.
+
+        Args:
+            x (torch.Tensor): Input feature tensor, shape (B, embed_dim).
+
+        Returns:
+            torch.Tensor: Output grid logits, shape (B, target_channels, target_h, target_w).
+        """
+        B = x.shape[0]
+        # Project and reshape to initial grid dimensions
+        x = self.dense(x) # (B, C * init_h * init_w)
+        # Reshape to (B, C, init_h, init_w) - Handle case where init_h/w might be 0 if target_size < factor
+        if self.init_h <= 0 or self.init_w <= 0:
+             raise ValueError(f"Decoder init_h ({self.init_h}) or init_w ({self.init_w}) is zero or negative. Target size too small for upsample factor.")
+        x = x.view(B, -1, self.init_h, self.init_w) # Use -1 for intermediate_channels
+
+        # Pass through CNN layers
+        x = self.decoder_cnn(x) # (B, target_channels, target_h, target_w)
+
+        return x
+
+
+# --- Updated decode_features_to_grid function ---
+def decode_features_to_grid(decoder_model, features, target_shape=None):
+    """
+    Decodes I-JEPA features back into a grid using the provided decoder model.
+
+    Args:
+        decoder_model (nn.Module): The trained decoder model (e.g., GridDecoder).
+        features (torch.Tensor): Pooled feature vector (D,) or (B, D).
+        target_shape (tuple, optional): Desired output grid shape (H, W).
+                                       Used for potential post-processing (cropping).
+
+    Returns:
+        np.ndarray: The decoded grid (H, W) with integer color indices, or None if decoding fails.
+    """
+    if decoder_model is None:
+         print("ERROR: Decoder model not provided to decode_features_to_grid.")
+         return None
+
+    decoder_model.eval() # Ensure decoder is in eval mode
+    device = next(decoder_model.parameters()).device # Get device from model
+
+    # Ensure features are on the correct device and have a batch dimension
+    if features.dim() == 1:
+        features = features.unsqueeze(0) # Add batch dim: (D,) -> (1, D)
+    features = features.to(device)
+
+    try:
+        with torch.no_grad(): # No need for gradients during decoding
+            # Get logits from the decoder model
+            # Output shape: (B, num_colors, H_fixed, W_fixed)
+            grid_logits = decoder_model(features)
+
+            # Get the predicted color index for each pixel by taking argmax over the color dimension
+            # Logits shape: (B, C, H, W) -> Predicted indices shape: (B, H, W)
+            predicted_indices = torch.argmax(grid_logits, dim=1)
+
+            # Assuming batch size is 1, remove batch dim
+            if predicted_indices.shape[0] == 1:
+                predicted_indices = predicted_indices.squeeze(0) # (H_fixed, W_fixed)
+            else:
+                # Handle case if somehow batch > 1 (shouldn't happen in current solver)
+                print("Warning: Decoder received batch size > 1, returning first element.")
+                predicted_indices = predicted_indices[0]
+
+            # Convert to NumPy array on CPU
+            decoded_grid_np = predicted_indices.cpu().numpy()
+
+            # --- Post-processing: Crop/Resize to original target shape ---
+            # The decoder outputs a fixed size. Crop if needed.
+            if target_shape:
+                h_orig, w_orig = target_shape
+                h_decoded, w_decoded = decoded_grid_np.shape
+                # Crop if the decoded grid is larger than the original target shape
+                if h_decoded > h_orig or w_decoded > w_orig:
+                     print(f"Decoder: Cropping decoded grid from {decoded_grid_np.shape} to {target_shape}.")
+                     final_grid_np = decoded_grid_np[:h_orig, :w_orig]
+                # Pad if the decoded grid is smaller? Unlikely with this decoder design.
+                elif h_decoded < h_orig or w_decoded < w_orig:
+                     print(f"Warning: Decoded grid {decoded_grid_np.shape} is smaller than target {target_shape}. Padding with 0s.")
+                     final_grid_np = np.zeros(target_shape, dtype=int) # Pad with 0 (background)
+                     final_grid_np[:h_decoded, :w_decoded] = decoded_grid_np
+                else:
+                     # Shapes match exactly
+                     final_grid_np = decoded_grid_np
+            else:
+                 # If no target shape, return the decoder's output directly
+                 final_grid_np = decoded_grid_np
+
+        return final_grid_np
+
+    except Exception as e:
+        print(f"ERROR during feature decoding: {e}")
+        return None
+
+
+# Helper for numpy grid comparison
+def compare_grids(grid1, grid2):
+    """ Checks if two numpy grids are identical. """
+    if grid1 is None or grid2 is None: return False
+    if not isinstance(grid1, np.ndarray) or not isinstance(grid2, np.ndarray):
+        try: # Attempt conversion if lists are passed
+            grid1 = np.array(grid1, dtype=int)
+            grid2 = np.array(grid2, dtype=int)
+        except Exception: return False # Conversion failed
+    if grid1.shape != grid2.shape: return False
+    return np.array_equal(grid1, grid2)
+
+
+class ARCSolver:
+    """
+    ARC Solver using Nearest Neighbor analogy in I-JEPA representation space.
+    Uses a GridDecoder to map predicted features back to a grid.
+    """
+    def __init__(self, i_jepa_model, device, target_size=(30, 30), pad_value=10):
+        """
+        Initializes the Representation Space Solver.
+
+        Args:
+            i_jepa_model (nn.Module): The (potentially adapted) IJEPA model. Must be provided.
+            device (torch.device): The device the model is on.
+            target_size (tuple): The fixed size tensors should be padded/cropped to for IJEPA.
+            pad_value (int): The index used for padding in grid_to_tensor.
+        """
+        if i_jepa_model is None:
+            raise ValueError("ARCSolver (Representation Space) requires an i_jepa_model instance.")
+
+        self.model = i_jepa_model
+        self.model.eval() # Ensure IJEPA model is in evaluation mode
+        self.device = device
+        self.target_size = target_size # Fixed size for IJEPA model processing
+        self.pad_value = pad_value   # Padding index used
+
+        # --- Instantiate the Decoder ---
+        try:
+            # Get embed_dim from the IJEPA model
+            embed_dim = self.model.embed_dim
+            # Assuming num_colors = 10 (0-9) for the output grid prediction
+            num_output_colors = 10
+            # Decoder outputs fixed size matching padded input size
+            self.decoder = GridDecoder(
+                embed_dim=embed_dim,
+                target_channels=num_output_colors,
+                target_size=target_size
+            ).to(device)
+            # *** IMPORTANT: Load pre-trained decoder weights here! ***
+            # Example:
+            # decoder_weights_path = "decoder_weights.pth"
+            # try:
+            #    self.decoder.load_state_dict(torch.load(decoder_weights_path, map_location=device))
+            #    print(f"Loaded pre-trained decoder weights from {decoder_weights_path}.")
+            # except FileNotFoundError:
+            #    print(f"WARNING: Decoder weights '{decoder_weights_path}' not found. Using randomly initialized decoder!")
+            # except Exception as e:
+            #    print(f"ERROR loading decoder weights: {e}. Using randomly initialized decoder!")
+            print("WARNING: Using randomly initialized GridDecoder. It needs to be trained.")
+            self.decoder.eval() # Set decoder to eval mode
+        except Exception as e:
+            print(f"ERROR Initializing GridDecoder: {e}")
+            self.decoder = None # Ensure decoder is None if init fails
+
+        # Store features and original output grid shape
+        self.train_data = [] # List of {'input_feat': tensor, 'output_feat': tensor, 'output_shape': tuple}
+        self.transformation_rule = "nearest_neighbor_feature_analogy"
+        print(f"--- ARCSolver (Representation Space NN with Decoder) Initialized ---")
+
+    def _get_features(self, grid):
+        """ Helper to convert grid to tensor and get pooled IJEPA features. """
+        # Convert grid to tensor matching IJEPA input size
+        tensor = grid_to_tensor(grid, target_size=self.target_size, pad_value=self.pad_value)
+        if tensor is None: return None
+        tensor = tensor.to(self.device).unsqueeze(0) # Add batch dim
+        # Get features using the IJEPA model
+        try:
+            with torch.no_grad():
+                features = self.model(tensor) # (1, N, D)
+                # Pool features across patches (average pooling)
+                pooled_features = features.mean(dim=1).squeeze(0) # (D,)
+            # Return features on CPU for distance calculation
+            return pooled_features.cpu()
+        except Exception as e:
+            print(f"Error getting features: {e}")
+            return None
+
+    def find_transformation(self, train_pairs):
+        """
+        Pre-computes and stores I-JEPA features for input and output grids
+        of the training pairs.
+
+        Args:
+            train_pairs (list): List of dicts {'input': grid, 'output': grid}.
+                                Grids are expected as list of lists or numpy arrays.
+        """
+        print(f"ARCSolver: Pre-computing features for {len(train_pairs)} training pairs (inputs & outputs)...")
+        self.train_data = []
+        for i, pair in enumerate(train_pairs):
+            input_grid = pair['input']
+            output_grid = pair['output']
+
+            # Get features for both input and output grids
+            input_feat = self._get_features(input_grid)
+            output_feat = self._get_features(output_grid)
+
+            # Skip pair if feature extraction failed
+            if input_feat is None or output_feat is None:
+                print(f"  WARNING: Failed to get features for training pair {i}. Skipping.")
+                continue
+
+            # Store features (CPU tensors) and the shape of the original output grid
+            try:
+                # Ensure output grid is numpy to get shape easily
+                output_shape = np.array(output_grid, dtype=int).shape
+            except Exception: # Handle cases where output grid might be malformed
+                 print(f"  WARNING: Could not determine shape for output grid of training pair {i}. Skipping.")
+                 continue
+
+            self.train_data.append({
+                'input_feat': input_feat,   # (D,) tensor on CPU
+                'output_feat': output_feat, # (D,) tensor on CPU
+                'output_shape': output_shape # Original (H, W) of the output grid
+            })
+        print(f"ARCSolver: Feature computation complete.")
+
+
+    def apply_transformation(self, test_input_grid):
+        """
+        Finds the nearest training input based on I-JEPA features, retrieves the
+        corresponding training output features, and decodes them into a grid using the decoder.
+
+        Args:
+            test_input_grid (np.ndarray or list): The test input grid.
+
+        Returns:
+            list[list[int]]: The predicted output grid (decoded from features).
+                             Returns the input grid if solving/decoding fails.
+        """
+        # Ensure we have pre-computed training data and a valid decoder
+        if not self.train_data:
+             print("ERROR: ARCSolver has no training data features stored. Cannot predict.")
+             return copy.deepcopy(test_input_grid) if isinstance(test_input_grid, list) else test_input_grid.tolist()
+        if self.decoder is None:
+             print("ERROR: ARCSolver decoder is not available. Cannot predict.")
+             return copy.deepcopy(test_input_grid) if isinstance(test_input_grid, list) else test_input_grid.tolist()
+
+
+        # Get features for the test input grid
+        test_input_feat = self._get_features(test_input_grid)
+
+        if test_input_feat is None:
+            print("ERROR: Failed to get features for test input. Falling back.")
+            return copy.deepcopy(test_input_grid) if isinstance(test_input_grid, list) else test_input_grid.tolist()
+
+        # Find the nearest neighbor training input based on feature distance
+        best_match_index = -1
+        min_distance = float('inf')
+        for i, train_example in enumerate(self.train_data):
+            train_feat = train_example['input_feat'] # Already on CPU
+            # Calculate L2 distance
+            distance = torch.linalg.norm(test_input_feat - train_feat)
+            if distance < min_distance:
+                min_distance = distance
+                best_match_index = i
+
+        # Check if a match was found
+        if best_match_index == -1:
+             print("ERROR: Could not find a best match. Falling back.")
+             return copy.deepcopy(test_input_grid) if isinstance(test_input_grid, list) else test_input_grid.tolist()
+
+        # Retrieve the OUTPUT features and the target shape from the best matching training pair
+        predicted_output_features = self.train_data[best_match_index]['output_feat']
+        target_output_shape = self.train_data[best_match_index]['output_shape']
+        print(f"ARCSolver: Predicting output features from matched example {best_match_index} (Dist: {min_distance:.4f}). Target shape: {target_output_shape}")
+
+        # --- Decode the predicted features back into a grid using the Decoder model ---
+        decoded_grid_np = decode_features_to_grid(
+            self.decoder,
+            predicted_output_features,
+            target_shape=target_output_shape # Pass target shape for potential cropping
+        )
+
+        # Check if decoding was successful
+        if decoded_grid_np is None:
+            print("ARCSolver: Decoding failed. Falling back.")
+            return copy.deepcopy(test_input_grid) if isinstance(test_input_grid, list) else test_input_grid.tolist()
+        else:
+            print("ARCSolver: Decoding and post-processing successful.")
+            # Convert final numpy grid to list of lists for the expected output format
+            return decoded_grid_np.tolist()
+
