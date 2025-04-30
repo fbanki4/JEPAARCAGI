@@ -1,0 +1,391 @@
+# i_jepa_module.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class PatchEmbed(nn.Module):
+    """
+    Embeds ARC grids into patches.
+    Takes (B, H, W) grid of color indices -> (B, N, embed_dim) patch embeddings
+    where N = (H/patch_size) * (W/patch_size)
+    """
+    def __init__(self, input_size=(30, 30), patch_size=3, num_colors=11, embed_dim=256, color_embed_dim=64):
+        super().__init__()
+        self.input_size = input_size
+        self.patch_size = patch_size
+        self.num_patches_h = input_size[0] // patch_size
+        self.num_patches_w = input_size[1] // patch_size
+        self.num_patches = self.num_patches_h * self.num_patches_w
+        self.num_colors = num_colors # 0-9 colors + 1 padding/special token
+        self.embed_dim = embed_dim
+        self.color_embed_dim = color_embed_dim # Intermediate embedding size for each color index
+
+        # Check if the configured input size is divisible by patch size
+        if input_size[0] % patch_size != 0 or input_size[1] % patch_size != 0:
+            # This assumes input grids will be padded/handled upstream by grid_to_tensor
+             print(f"Warning: Model configured for input size {input_size} which is assumed to be divisible by patch size {patch_size}.")
+             # If perfect divisibility is required, raise ValueError here.
+
+        # Embedding layer for color indices
+        self.color_embedding = nn.Embedding(num_colors, color_embed_dim)
+        # Linear projection layer to map flattened patch embeddings to the final dimension
+        self.projection = nn.Linear(patch_size * patch_size * color_embed_dim, embed_dim)
+
+    def forward(self, x):
+        """
+        Forward pass for patch embedding.
+
+        Args:
+            x (torch.Tensor): Input grid tensor shape (B, H, W), type Long or Int.
+                              Assumes values are color indices (0 to num_colors-1).
+                              Assumes H and W match self.input_size after padding/processing.
+        Returns:
+            torch.Tensor: Patch embeddings shape (B, num_patches, embed_dim)
+        """
+        B, H, W = x.shape
+        # Verify input dimensions match the configured size (important after padding)
+        if not (H == self.input_size[0] and W == self.input_size[1]):
+             # This check might be too strict if allowing dynamic input sizes + interpolation later
+             # For now, assume grid_to_tensor enforces the size.
+             print(f"Warning: Input grid size ({H}x{W}) differs from model's configured input_size ({self.input_size[0]}x{self.input_size[1]}). Ensure padding is correct.")
+             # Alternatively, raise error:
+             # raise ValueError(f"Input image size ({H}x{W}) doesn't match expected ({self.input_size[0]}x{self.input_size[1]})")
+
+
+        # 1. Embed color indices: (B, H, W) -> (B, H, W, color_embed_dim)
+        x = self.color_embedding(x)
+
+        # 2. Reshape for Unfold: (B, H, W, color_embed_dim) -> (B, color_embed_dim, H, W)
+        x = x.permute(0, 3, 1, 2)
+
+        # 3. Extract patches using Unfold: (B, C, H, W) -> (B, C*k*k, N)
+        # k = patch_size, C = color_embed_dim, N = num_patches
+        patches = F.unfold(x, kernel_size=self.patch_size, stride=self.patch_size)
+        # Shape: (B, color_embed_dim * patch_size * patch_size, num_patches)
+
+        # 4. Reshape for projection: (B, num_patches, C*k*k)
+        patches = patches.transpose(1, 2)
+
+        # 5. Project patches: (B, num_patches, C*k*k) -> (B, num_patches, embed_dim)
+        embeddings = self.projection(patches)
+
+        return embeddings
+
+
+class IJEPA(nn.Module):
+    """
+    Image-based Joint-Embedding Predictive Architecture (I-JEPA) model adapted for ARC.
+    Uses Vision Transformer blocks for encoder and predictor.
+    """
+    def __init__(self,
+                 input_size=(30, 30),
+                 patch_size=3,
+                 num_colors=11, # 0-9 colors + 1 padding value (e.g., index 10)
+                 embed_dim=256,
+                 color_embed_dim=64,
+                 # --- Encoder Params ---
+                 encoder_depth=6,
+                 encoder_num_heads=4,
+                 encoder_mlp_ratio=4.0,
+                 # --- Predictor Params ---
+                 predictor_embed_dim=256,
+                 predictor_depth=3,
+                 predictor_num_heads=4,
+                 predictor_mlp_ratio=4.0,
+                 # --- Other ---
+                 use_pos_embed=True
+                ):
+        super().__init__()
+        self.input_size = input_size
+        self.patch_size = patch_size
+        self.num_colors = num_colors
+        self.embed_dim = embed_dim # Target embedding dimension (output of target encoder)
+        self.predictor_embed_dim = predictor_embed_dim # Internal dimension of predictor
+        self.use_pos_embed = use_pos_embed
+
+        # 1. Patch Embedding Layer
+        self.patch_embed = PatchEmbed(
+            input_size=input_size,
+            patch_size=patch_size,
+            num_colors=num_colors,
+            embed_dim=embed_dim,
+            color_embed_dim=color_embed_dim
+        )
+        self.num_patches = self.patch_embed.num_patches
+
+        # 2. Positional Embedding (Learnable)
+        if self.use_pos_embed:
+            # Standard 1D learnable positional embedding
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=.02) # Initialize
+        else:
+            self.pos_embed = None
+
+        # 3. Context Encoder (Vision Transformer Blocks)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=encoder_num_heads,
+            dim_feedforward=int(embed_dim * encoder_mlp_ratio),
+            dropout=0.1, # Standard dropout, can be tuned
+            activation=F.gelu, # Standard activation
+            batch_first=True,  # Input format is (B, N, D)
+            norm_first=True    # Apply LayerNorm before Attention/FFN
+        )
+        encoder_norm = nn.LayerNorm(embed_dim) # Final normalization layer
+        self.context_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=encoder_depth,
+            norm=encoder_norm # Apply norm after the final layer
+        )
+
+        # 4. Predictor (Vision Transformer Blocks)
+        # Define mask token - learnable vector representing patches to be predicted
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
+        nn.init.trunc_normal_(self.mask_token, std=.02) # Initialize
+
+        # Predictor Transformer uses its own dimension (predictor_embed_dim)
+        predictor_layer = nn.TransformerEncoderLayer(
+            d_model=predictor_embed_dim,
+            nhead=predictor_num_heads,
+            dim_feedforward=int(predictor_embed_dim * predictor_mlp_ratio),
+            dropout=0.1,
+            activation=F.gelu,
+            batch_first=True,
+            norm_first=True
+        )
+        predictor_norm = nn.LayerNorm(predictor_embed_dim) # Final normalization layer
+        self.predictor = nn.TransformerEncoder(
+            predictor_layer,
+            num_layers=predictor_depth,
+            norm=predictor_norm
+        )
+
+        # 5. Final prediction head (maps predictor output dimension to target encoder dimension)
+        self.prediction_head = nn.Linear(predictor_embed_dim, embed_dim)
+
+        # 6. Target Encoder (Weight Sharing handled implicitly in forward_loss)
+        # No separate parameters needed here; uses context_encoder weights without gradient update.
+
+        print(f"--- IJEPA Initialized with ViT Encoder & Predictor ---")
+        print(f"  Input Size: {input_size}, Patch Size: {patch_size}x{patch_size}, Num Patches: {self.num_patches}")
+        print(f"  Encoder Depth: {encoder_depth}, Heads: {encoder_num_heads}, Dim: {embed_dim}")
+        print(f"  Predictor Depth: {predictor_depth}, Heads: {predictor_num_heads}, Dim: {predictor_embed_dim}")
+        print(f"  Use Pos Embed: {use_pos_embed}")
+
+
+    def _get_pos_embedding(self, B, indices):
+        """ Helper function to gather positional embeddings based on patch indices. """
+        if self.pos_embed is None:
+            return None
+        # Expand positional embeddings to batch size
+        pos_embed = self.pos_embed.expand(B, -1, -1)
+        # Ensure indices are on the same device as pos_embed before gather
+        indices = indices.to(pos_embed.device)
+        # Gather embeddings corresponding to the provided indices
+        return torch.gather(pos_embed, 1, indices.unsqueeze(-1).expand(-1, -1, self.embed_dim))
+
+    def forward_features(self, x, context_mask):
+        """
+        Encodes the input grid using the context encoder on visible (unmasked) patches.
+
+        Args:
+            x (Tensor): Input grid (B, H, W), assumes H,W match model input_size.
+            context_mask (Tensor): Boolean mask (B, num_patches). True indicates KEEP (context).
+
+        Returns:
+            Tensor: Representations of the context patches (B, num_context_patches, embed_dim)
+            Tensor: Indices of the context patches (B, num_context_patches)
+        """
+        B = x.shape[0]
+        # 1. Embed input grid into patches
+        x = self.patch_embed(x) # (B, N, D)
+        # 2. Add positional embedding if enabled
+        if self.pos_embed is not None:
+             x = x + self.pos_embed
+
+        # 3. Select context patches using the mask
+        # Ensure mask is on the correct device
+        context_mask = context_mask.to(x.device)
+        # Get indices of patches to keep (where mask is True)
+        context_indices = context_mask.nonzero(as_tuple=False)[:, 1].reshape(B, -1)
+        # Gather the corresponding patch embeddings
+        context_tokens = torch.gather(x, 1, context_indices.unsqueeze(-1).expand(-1, -1, self.embed_dim))
+
+        # 4. Pass selected context tokens through the encoder
+        # ** Caveat Reminder **: nn.TransformerEncoder might expect padding/mask for variable lengths.
+        # This implementation assumes it works or that masks/padding are handled appropriately
+        # upstream/downstream if needed. A more robust implementation might require padding
+        # the gathered tokens or using custom attention masks.
+        encoded_context = self.context_encoder(context_tokens)
+
+        # Return encoded tokens and their original indices
+        return encoded_context, context_indices
+
+    def forward_predictor(self, encoded_context, context_indices, target_indices):
+        """
+        Applies the predictor transformer to context tokens and mask tokens representing targets.
+
+        Args:
+            encoded_context (Tensor): Output of context encoder (B, num_context, D_enc)
+            context_indices (Tensor): Indices of context patches (B, num_context)
+            target_indices (Tensor): Indices of target patches (B, num_target)
+
+        Returns:
+            Tensor: Predicted representations for target patches (B, num_target, D_embed)
+                    (Dimension matches the target encoder output via prediction_head)
+        """
+        B = encoded_context.shape[0]
+        num_context = context_indices.shape[1]
+        num_target = target_indices.shape[1]
+
+        # 1. Get positional embeddings for both context and target patches
+        # Ensure indices are on the correct device before calling _get_pos_embedding
+        pos_embed_context = self._get_pos_embedding(B, context_indices.to(self.pos_embed.device))
+        pos_embed_target = self._get_pos_embedding(B, target_indices.to(self.pos_embed.device))
+
+        # 2. Create mask tokens for target positions, add target pos embeddings
+        # Expand the single mask token to the number of targets
+        predictor_mask_tokens = self.mask_token.expand(B, num_target, -1)
+        if pos_embed_target is not None:
+             # Add positional embedding to the mask tokens (makes them position-aware)
+             # Ensure embeddings are on the same device as mask_tokens
+             predictor_mask_tokens = predictor_mask_tokens + pos_embed_target.to(predictor_mask_tokens.device)
+
+        # 3. Add positional embeddings to the encoded context tokens
+        if pos_embed_context is not None:
+             # Ensure embeddings are on the same device as context tokens
+             encoded_context = encoded_context + pos_embed_context.to(encoded_context.device)
+
+        # 4. Concatenate context tokens and position-aware mask tokens for predictor input
+        predictor_input = torch.cat([encoded_context, predictor_mask_tokens], dim=1)
+        # Shape: (B, num_context + num_target, D_pred)
+
+        # 5. Pass concatenated sequence through the predictor transformer
+        predictor_output = self.predictor(predictor_input)
+        # Shape: (B, num_context + num_target, D_pred)
+
+        # 6. Extract only the outputs corresponding to the input MASK token positions (targets)
+        # These are the last `num_target` tokens in the output sequence
+        predicted_target_representations = predictor_output[:, num_context:, :]
+        # Shape: (B, num_target, D_pred)
+
+        # 7. Apply final prediction head to map to target embedding dimension
+        predicted_target_representations = self.prediction_head(predicted_target_representations)
+        # Shape: (B, num_target, D_embed) -- Matches target encoder output dim
+
+        return predicted_target_representations
+
+    def forward_loss(self, x, context_masks, target_masks):
+        """
+        Calculates the I-JEPA loss by comparing predicted target representations
+        with actual target representations from a non-gradient target encoder.
+
+        Args:
+            x (Tensor): Input grid (B, H, W), assumes H,W match model input_size.
+            context_masks (list[Tensor]): List of boolean masks (B, N) for M context blocks.
+            target_masks (list[Tensor]): List of boolean masks (B, N) for M target blocks.
+
+        Returns:
+            Tensor: The calculated average MSE loss over valid context/target pairs.
+            dict: Dictionary containing intermediate values (e.g., the loss value).
+        """
+        B = x.shape[0]
+        # 1. Embed patches once for the input grid
+        all_patches = self.patch_embed(x) # (B, N, D)
+        if self.pos_embed is not None:
+            all_patches = all_patches + self.pos_embed
+
+        total_loss = 0
+        num_valid_pairs = 0 # Count pairs where target mask is not empty
+
+        # Make sure masks are on the correct device
+        device = x.device
+        context_masks = [mask.to(device) for mask in context_masks]
+        target_masks = [mask.to(device) for mask in target_masks]
+
+        # Iterate through each context/target mask pair provided
+        for i in range(len(context_masks)):
+            context_mask = context_masks[i] # (B, N) boolean, True=Keep Context
+            target_mask = target_masks[i]   # (B, N) boolean, True=Target
+
+            # Skip if the target mask is empty (no patches to predict)
+            if not target_mask.any():
+                continue
+
+            num_valid_pairs += 1
+
+            # --- Get Target Representations (using Target Encoder = Context Encoder weights, NO GRAD) ---
+            with torch.no_grad(): # Ensure no gradients are computed for the target encoder path
+                # Get indices for target patches
+                target_indices = target_mask.nonzero(as_tuple=False)[:, 1].reshape(B, -1)
+                num_target = target_indices.shape[1]
+
+                # Gather target patch tokens (detach from graph before gathering)
+                target_tokens = torch.gather(all_patches.detach(), 1, target_indices.unsqueeze(-1).expand(-1, -1, self.embed_dim))
+
+                # Use the context encoder network as the target encoder
+                # Setting to eval() might affect dropout/layernorm, but typically done within no_grad
+                # self.context_encoder.eval() # Optional: Set to eval mode for target encoding
+                target_representations_actual = self.context_encoder(target_tokens) # (B, num_target, D)
+                # self.context_encoder.train() # Switch back if eval was used
+
+            # --- Get Context Representations (using Context Encoder, WITH GRAD) ---
+            context_indices = context_mask.nonzero(as_tuple=False)[:, 1].reshape(B, -1)
+            # Gather context patch tokens (gradients will flow back through this)
+            context_tokens = torch.gather(all_patches, 1, context_indices.unsqueeze(-1).expand(-1, -1, self.embed_dim))
+            # Pass through the context encoder (this part is trained)
+            encoded_context = self.context_encoder(context_tokens) # (B, num_context, D)
+
+            # --- Predict Target Representations using Predictor ---
+            predicted_target_reps = self.forward_predictor(encoded_context, context_indices, target_indices)
+            # Shape: (B, num_target, D_embed)
+
+            # --- Calculate Loss for this pair (MSE between normalized representations) ---
+            # Normalize targets per-patch before loss calculation
+            target_norm = F.layer_norm(target_representations_actual, [self.embed_dim])
+            # Normalize predictions per-patch before loss calculation
+            pred_norm = F.layer_norm(predicted_target_reps, [self.embed_dim])
+
+            # Calculate MSE loss between normalized prediction and detached normalized target
+            loss = F.mse_loss(pred_norm, target_norm.detach())
+
+            # Accumulate loss
+            total_loss = total_loss + loss
+
+        # --- Final Loss Calculation ---
+        if num_valid_pairs == 0:
+             # Handle case where all target masks were empty
+             print("Warning: No valid target masks found in forward_loss.")
+             # Return 0 loss tensor (ensure it requires grad if backprop needed even on failure)
+             # If no valid pairs, no gradient can be computed anyway.
+             final_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        else:
+             # Average loss over the valid pairs processed
+             final_loss = total_loss / num_valid_pairs
+
+        # Return loss and optional info dictionary
+        info = {'loss': final_loss.item()}
+        return final_loss, info
+
+
+    def forward(self, x):
+        """
+        Standard forward pass for inference (no masking).
+        Typically used to get features for a downstream task/solver.
+
+        Args:
+            x (Tensor): Input grid (B, H, W)
+
+        Returns:
+            Tensor: Feature representation (B, num_patches, embed_dim)
+        """
+        B = x.shape[0]
+        # 1. Embed patches
+        x = self.patch_embed(x)
+        # 2. Add positional embedding
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
+        # 3. Pass *all* tokens through the Context Encoder
+        features = self.context_encoder(x) # Pass full sequence
+        return features
