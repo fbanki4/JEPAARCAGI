@@ -1,0 +1,585 @@
+# arc_utils.py
+import torch
+import random
+import math
+import numpy as np
+from scipy.ndimage import label, find_objects # For object detection
+
+# --- Object Finding ---
+
+def find_objects(grid, connectivity=2, exclude_colors=[0], include_colors=None):
+    """
+    Finds connected components (objects) in a grid based on color using scipy.ndimage.label.
+
+    Args:
+        grid (list[list[int]] or np.ndarray): The input grid.
+        connectivity (int): Connectivity for labelling (1 for 4-way, 2 for 8-way). Default is 2 (8-way).
+        exclude_colors (list[int]): List of colors to treat as background (ignore). Default is [0].
+        include_colors (list[int], optional): If provided, only find objects of these colors. Default is None (find all non-excluded).
+
+    Returns:
+        list[dict]: A list of dictionaries, each representing an object with keys:
+            'color' (int): The color of the object.
+            'pixels' (list[tuple]): List of (row, col) coordinates.
+            'bbox' (tuple): Bounding box (min_row, min_col, max_row, max_col). Inclusive.
+            'mask' (np.ndarray): Boolean mask of the object on the original grid dimensions.
+            'size' (int): Number of pixels in the object.
+            'height' (int): Height of the bounding box.
+            'width' (int): Width of the bounding box.
+    """
+    # Ensure grid is a NumPy array
+    if not isinstance(grid, np.ndarray):
+        grid_np = np.array(grid, dtype=int)
+    else:
+        grid_np = grid
+
+    objects = []
+    # Keep track of pixels already assigned to an object to avoid duplicates if colors overlap
+    processed_mask = np.zeros_like(grid_np, dtype=bool)
+
+    # Determine which colors to process
+    unique_colors = np.unique(grid_np)
+    if include_colors is not None:
+        colors_to_process = [c for c in include_colors if c not in exclude_colors]
+    else:
+        colors_to_process = [c for c in unique_colors if c not in exclude_colors]
+
+    # Define connectivity structure for scipy.ndimage.label
+    structure = np.ones((3, 3), dtype=bool) if connectivity == 2 else \
+                np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+    # Process each relevant color separately
+    for color in colors_to_process:
+        # Create a mask for the current color, ignoring already processed pixels
+        color_mask = (grid_np == color) & (~processed_mask)
+
+        if not color_mask.any(): # Skip if no pixels of this color remain
+            continue
+
+        # Find connected components for this color
+        labeled_array, num_labels = label(color_mask, structure=structure)
+
+        if num_labels == 0: # Skip if no components found (shouldn't happen if color_mask.any() is true)
+            continue
+
+        # Get slices (approximate bounding boxes) for each label using find_objects
+        # Note: find_objects returns slices for labels 1 to num_labels
+        slices = find_objects(labeled_array)
+
+        # Extract information for each labeled component
+        for i in range(num_labels):
+            label_id = i + 1 # Labels are 1-based
+            # obj_slice = slices[i] # Slice object from find_objects
+
+            # Get precise pixel coordinates for this object
+            obj_pixels_mask = (labeled_array == label_id)
+            rows, cols = np.where(obj_pixels_mask)
+            pixels = list(zip(rows, cols))
+
+            if not pixels: # Should not happen if num_labels > 0 but safety check
+                continue
+
+            # Calculate precise bounding box from pixel coordinates
+            min_row, min_col = rows.min(), cols.min()
+            max_row, max_col = rows.max(), cols.max()
+            bbox = (min_row, min_col, max_row, max_col)
+            height = max_row - min_row + 1
+            width = max_col - min_col + 1
+            size = len(pixels)
+
+            # Create the full-size boolean mask for this object
+            mask_full = np.zeros_like(grid_np, dtype=bool)
+            mask_full[rows, cols] = True
+
+            # Store object data
+            object_data = {
+                'color': color,
+                'pixels': pixels,
+                'bbox': bbox,
+                'mask': mask_full,
+                'size': size,
+                'height': height,
+                'width': width,
+            }
+            objects.append(object_data)
+
+            # Mark these pixels as processed so they aren't picked up again
+            processed_mask[rows, cols] = True
+
+    return objects
+
+
+# --- DSL Primitives: Object Manipulation ---
+
+def dsl_move(grid, obj_to_move, dr, dc, background_color=0):
+    """
+    Moves an object by (dr, dc) on the grid. Returns a new grid.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        obj_to_move (dict): Object dictionary (from find_objects).
+        dr (int): Row delta.
+        dc (int): Column delta.
+        background_color (int): Color to fill the original object location. Default 0.
+
+    Returns:
+        np.ndarray: A new grid with the object moved, or None if move is invalid/out of bounds.
+    """
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+    new_grid = grid.copy()
+    obj_color = obj_to_move['color']
+    obj_pixels = obj_to_move['pixels'] # List of (r, c) tuples
+    grid_h, grid_w = grid.shape
+
+    new_pixel_coords = []
+    valid_move = True
+
+    # Check validity and calculate new positions first
+    for r, c in obj_pixels:
+        new_r, new_c = r + dr, c + dc
+        if not (0 <= new_r < grid_h and 0 <= new_c < grid_w):
+            valid_move = False
+            break
+        new_pixel_coords.append((new_r, new_c))
+
+    if not valid_move:
+        # print("Warning: dsl_move resulted in out-of-bounds position.")
+        return None # Indicate invalid move
+
+    # Clear old object location
+    for r, c in obj_pixels:
+        new_grid[r, c] = background_color
+
+    # Draw object at new location
+    for new_r, new_c in new_pixel_coords:
+        new_grid[new_r, new_c] = obj_color
+
+    return new_grid
+
+
+def dsl_copy(grid, obj_to_copy, target_top_left):
+    """
+    Copies an object to a new location specified by the target top-left corner.
+    Overwrites existing pixels at the target location. Returns a new grid.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        obj_to_copy (dict): Object dictionary (from find_objects).
+        target_top_left (tuple): (target_row, target_col) for the new top-left position
+                                 relative to the object's original bounding box top-left.
+
+    Returns:
+        np.ndarray: A new grid with the object copied, or None if target is invalid/off-grid.
+    """
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+    new_grid = grid.copy()
+    obj_color = obj_to_copy['color']
+    obj_pixels = obj_to_copy['pixels'] # List of (r, c) tuples
+    min_r, min_c, _, _ = obj_to_copy['bbox']
+    target_r_start, target_c_start = target_top_left
+    grid_h, grid_w = grid.shape
+
+    valid_copy = False # Track if at least one pixel is successfully copied
+    for r, c in obj_pixels:
+        # Calculate relative position within bounding box
+        rel_r = r - min_r
+        rel_c = c - min_c
+
+        # Calculate absolute target position
+        target_r = target_r_start + rel_r
+        target_c = target_c_start + rel_c
+
+        # Check bounds and draw if valid
+        if 0 <= target_r < grid_h and 0 <= target_c < grid_w:
+            new_grid[target_r, target_c] = obj_color
+            valid_copy = True
+        # else:
+            # Optional: Decide if the whole copy fails if any part is out of bounds
+            # return None
+
+    # Return None if no pixels could be copied at all
+    return new_grid if valid_copy else None
+
+
+def dsl_recolor(grid, obj_to_recolor, new_color):
+    """
+    Changes the color of an object. Returns a new grid.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        obj_to_recolor (dict): Object dictionary (from find_objects).
+        new_color (int): The new color index (0-9).
+
+    Returns:
+        np.ndarray: A new grid with the object recolored, or None if color is invalid.
+    """
+    # Validate new color
+    if not (0 <= new_color <= 9):
+        # print(f"Warning: dsl_recolor invalid new_color {new_color}.")
+        return None # Indicate invalid color
+
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+    new_grid = grid.copy()
+    obj_pixels = obj_to_recolor['pixels'] # List of (r, c) tuples
+
+    # Recolor each pixel of the object
+    for r, c in obj_pixels:
+        # Basic bounds check for safety, though pixels should be valid if from find_objects
+        if 0 <= r < new_grid.shape[0] and 0 <= c < new_grid.shape[1]:
+             new_grid[r, c] = new_color
+
+    return new_grid
+
+
+# --- DSL Primitives: Grid-Level Operations ---
+
+def dsl_rotate(grid, angle):
+    """
+    Rotates the entire grid by angle degrees (90, 180, 270). Returns new grid.
+    Rotation is counter-clockwise using np.rot90.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        angle (int): Angle of rotation (must be 90, 180, or 270).
+
+    Returns:
+        np.ndarray: The rotated grid, or None if angle is invalid.
+    """
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+
+    # Map angle to number of 90-degree rotations (k for rot90)
+    if angle == 90: k = 1
+    elif angle == 180: k = 2
+    elif angle == 270: k = 3
+    else:
+        # print(f"Warning: dsl_rotate invalid angle {angle}. Must be 90, 180, or 270.")
+        return None # Invalid angle
+
+    # Perform rotation and return a copy
+    return np.rot90(grid, k=k).copy()
+
+
+def dsl_flip(grid, axis):
+    """
+    Flips the entire grid horizontally or vertically. Returns new grid.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        axis (int or str): Axis to flip over.
+                           0 or 'vertical' for up-down flip.
+                           1 or 'horizontal' for left-right flip.
+
+    Returns:
+        np.ndarray: The flipped grid, or None if axis is invalid.
+    """
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+
+    # Determine the axis for np.flip
+    if axis == 0 or str(axis).lower() == 'vertical':
+        flip_axis = 0
+    elif axis == 1 or str(axis).lower() == 'horizontal':
+        flip_axis = 1
+    else:
+        # print(f"Warning: dsl_flip invalid axis {axis}. Must be 0/vertical or 1/horizontal.")
+        return None # Invalid axis
+
+    # Perform flip and return a copy
+    return np.flip(grid, axis=flip_axis).copy()
+
+
+def dsl_crop_to_content(grid, background_color=0):
+    """
+    Crops the grid to the smallest bounding box containing non-background pixels.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        background_color (int): Color to consider as background. Default 0.
+
+    Returns:
+        np.ndarray: The cropped grid. Returns a 1x1 grid of background_color
+                    if the input grid has no non-background pixels.
+    """
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+
+    try:
+        # Find coordinates of non-background pixels
+        rows, cols = np.where(grid != background_color)
+        if rows.size == 0:
+            # Grid is empty or contains only background color
+            return np.array([[background_color]], dtype=int)
+
+        # Determine bounding box
+        min_row, max_row = rows.min(), rows.max()
+        min_col, max_col = cols.min(), cols.max()
+
+        # Crop and return a copy
+        return grid[min_row : max_row + 1, min_col : max_col + 1].copy()
+    except Exception as e:
+        # Handle potential errors with empty grids or other issues
+        print(f"Error in dsl_crop_to_content: {e}")
+        return np.array([[background_color]], dtype=int) # Fallback
+
+
+# --- DSL Primitives: Advanced Object Operations ---
+
+def dsl_scale_object(grid, obj_to_scale, factor, background_color=0):
+    """
+    Scales an object by an integer factor (pixel replication). Returns a new grid.
+    Keeps the original top-left corner of the bounding box as the anchor.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        obj_to_scale (dict): Object dictionary (from find_objects).
+        factor (int): Integer scaling factor (>= 1). Factor=1 returns copy.
+        background_color (int): Color for clearing original location.
+
+    Returns:
+        np.ndarray: New grid with scaled object, or None if factor is invalid or scale fails.
+    """
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+    # Validate factor
+    if not isinstance(factor, int) or factor < 1:
+        # print("Warning: dsl_scale_object factor must be an integer >= 1.")
+        return None
+
+    # If factor is 1, just return a copy (no change)
+    if factor == 1: return grid.copy()
+
+    new_grid = grid.copy()
+    obj_pixels = obj_to_scale['pixels']
+    obj_color = obj_to_scale['color']
+    min_r, min_c, _, _ = obj_to_scale['bbox']
+    grid_h, grid_w = grid.shape
+
+    # 1. Clear original object location on the new grid
+    for r, c in obj_pixels:
+        new_grid[r, c] = background_color
+
+    # 2. Draw scaled object by replicating each pixel into a factor x factor block
+    scaled_pixels_drawn = 0
+    for r, c in obj_pixels:
+        # Calculate top-left corner of the factor x factor block for this pixel
+        # Anchor point is the top-left of the original bounding box
+        start_r = min_r + (r - min_r) * factor
+        start_c = min_c + (c - min_c) * factor
+
+        # Draw the factor x factor block
+        for dr in range(factor):
+            for dc in range(factor):
+                target_r, target_c = start_r + dr, start_c + dc
+                # Check bounds before drawing
+                if 0 <= target_r < grid_h and 0 <= target_c < grid_w:
+                    new_grid[target_r, target_c] = obj_color
+                    scaled_pixels_drawn +=1
+
+    # Return None if the scaled object would be entirely off-grid or if no pixels were drawn
+    return new_grid if scaled_pixels_drawn > 0 else None
+
+
+def dsl_rotate_object(grid, obj_to_rotate, angle, background_color=0):
+    """
+    Rotates an object within its bounding box by 90, 180, 270 degrees.
+    Rotation is around the center of the bounding box. Returns a new grid.
+
+    Args:
+        grid (np.ndarray): The input grid.
+        obj_to_rotate (dict): Object dictionary (from find_objects).
+        angle (int): Angle (90, 180, 270), counter-clockwise.
+        background_color (int): Color for clearing original location.
+
+    Returns:
+        np.ndarray: New grid with rotated object, or None if angle invalid or rotation fails.
+    """
+    if not isinstance(grid, np.ndarray): grid = np.array(grid, dtype=int)
+
+    obj_pixels = obj_to_rotate['pixels']
+    obj_color = obj_to_rotate['color']
+    min_r, min_c, max_r, max_c = obj_to_rotate['bbox']
+    h = obj_to_rotate['height']
+    w = obj_to_rotate['width']
+    grid_h, grid_w = grid.shape
+
+    # 1. Create cropped representation of the object (local coordinates)
+    cropped_obj = np.full((h, w), background_color, dtype=int)
+    for r, c in obj_pixels:
+        cropped_obj[r - min_r, c - min_c] = obj_color
+
+    # 2. Rotate the cropped object using np.rot90
+    if angle == 90: k = 1
+    elif angle == 180: k = 2
+    elif angle == 270: k = 3
+    else: return None # Invalid angle
+    rotated_cropped_obj = np.rot90(cropped_obj, k=k)
+    new_h, new_w = rotated_cropped_obj.shape # Get dimensions of rotated cropped object
+
+    # 3. Calculate new top-left position to keep the object centered
+    #    (Place the center of the new bounding box at the center of the old bounding box)
+    # Original center (relative to grid origin) using floating point for accuracy
+    center_r = min_r + (h - 1) / 2.0
+    center_c = min_c + (w - 1) / 2.0
+    # Calculate required top-left corner for the new rotated object
+    new_min_r = int(round(center_r - (new_h - 1) / 2.0))
+    new_min_c = int(round(center_c - (new_w - 1) / 2.0))
+
+    # 4. Create new grid, clear old location, and place rotated object
+    new_grid = grid.copy()
+
+    # Clear original object location
+    for r, c in obj_pixels:
+        new_grid[r, c] = background_color
+
+    # Draw rotated object onto the new grid
+    placed_pixels = 0
+    for r_rel in range(new_h): # Iterate through rotated cropped object rows
+        for c_rel in range(new_w): # Iterate through rotated cropped object columns
+            # If this pixel in the rotated cropped object is not background
+            if rotated_cropped_obj[r_rel, c_rel] != background_color:
+                # Calculate target position on the full grid
+                target_r = new_min_r + r_rel
+                target_c = new_min_c + c_rel
+                # Check bounds before drawing
+                if 0 <= target_r < grid_h and 0 <= target_c < grid_w:
+                    new_grid[target_r, target_c] = obj_color # Use original object color
+                    placed_pixels +=1
+
+    # Return the new grid only if some pixels were successfully placed
+    return new_grid if placed_pixels > 0 else None
+
+
+# --- DSL Program Execution ---
+
+def execute_dsl_program(program, initial_grid):
+    """
+    Executes a sequence of DSL operations on a grid.
+
+    Args:
+        program (list[tuple]): A list where each tuple represents an operation:
+                               (function_name_str, *args).
+                               Example: [('dsl_recolor', obj1, 5), ('dsl_move', obj1, 1, 0)]
+                               Assumes function names correspond to functions defined in this module
+                               and obj arguments are valid object dictionaries (or handled carefully).
+        initial_grid (np.ndarray): The starting grid.
+
+    Returns:
+        np.ndarray: The final grid after applying all operations, or None if any step fails.
+    """
+    current_grid = initial_grid.copy() # Start with a copy
+
+    for operation in program:
+        try:
+            func_name = operation[0]
+            args = operation[1:] # Arguments for the DSL function
+
+            # Find the actual function based on its name string
+            # This requires the dsl functions to be accessible in the current scope
+            # Using globals() is one way, explicit mapping might be safer.
+            dsl_func = globals().get(func_name)
+
+            if dsl_func is None or not callable(dsl_func):
+                print(f"ERROR: DSL function '{func_name}' not found or not callable.")
+                return None
+
+            # --- Object Reference Handling (Potential Issue Here!) ---
+            # If args contain object dictionaries from a *previous* grid state,
+            # they might be invalid for the current_grid.
+            # A robust solution needs to re-find corresponding objects in current_grid
+            # based on properties or track objects across steps.
+            # Current simple execution assumes args are either non-object args,
+            # or the DSL function itself handles finding the relevant object based on args.
+            # Example: ('dsl_recolor_largest', 'blue', 'red') -> dsl_recolor_largest finds the object.
+            # Example: ('dsl_move', obj_dict_from_step_1, 1, 0) -> This is fragile!
+
+            # The first argument to DSL functions is always the grid
+            current_grid = dsl_func(current_grid, *args)
+
+            # If any operation fails (returns None), the whole program fails
+            if current_grid is None:
+                # print(f"DSL program failed at step: {operation}") # Debug
+                return None
+
+        except Exception as e:
+            print(f"ERROR executing DSL operation {operation}: {e}")
+            return None # Program failed
+
+    return current_grid
+
+
+# --- Mask Generation Functions (Only needed if IJEPA adaptation is run) ---
+def _get_random_rectangular_block_mask(num_patches_h, num_patches_w, min_scale, max_scale, device):
+    """Generates a boolean mask for a random rectangular block of patches."""
+    # ... (implementation from previous step remains unchanged) ...
+    total_patches = num_patches_h * num_patches_w; log_aspect_ratio = (math.log(0.3), math.log(1.0 / 0.3)); max_tries = 20
+    for _ in range(max_tries):
+        target_scale = random.uniform(min_scale, max_scale); target_area = int(target_scale * total_patches);
+        if target_area == 0: continue
+        aspect_ratio = math.exp(random.uniform(*log_aspect_ratio)); h = int(round(math.sqrt(target_area * aspect_ratio))); w = int(round(math.sqrt(target_area / aspect_ratio)))
+        h = max(1, min(h, num_patches_h)); w = max(1, min(w, num_patches_w))
+        if num_patches_h - h < 0 or num_patches_w - w < 0: continue
+        top = random.randint(0, num_patches_h - h); left = random.randint(0, num_patches_w - w)
+        mask = torch.zeros((num_patches_h, num_patches_w), dtype=torch.bool, device=device); mask[top : top + h, left : left + w] = True
+        return mask.flatten().unsqueeze(0)
+    return None
+
+def _get_random_patch_sampling_mask(total_patches, min_scale, max_scale, device, available_mask):
+    """Generates a boolean mask by randomly sampling patches from available locations."""
+    # ... (implementation from previous step remains unchanged) ...
+    min_count = int(min_scale * total_patches); max_count = int(max_scale * total_patches); target_count = random.randint(min_count, max_count)
+    if target_count == 0: return torch.zeros((1, total_patches), dtype=torch.bool, device=device)
+    available_indices = torch.nonzero(available_mask.flatten(), as_tuple=False).squeeze(-1); num_available = len(available_indices)
+    if num_available == 0: return None
+    num_to_sample = min(target_count, num_available)
+    if num_to_sample < min_count and target_count >= min_count and num_available >= min_count: num_to_sample = min(min_count, num_available)
+    if num_to_sample == 0: return torch.zeros((1, total_patches), dtype=torch.bool, device=device)
+    sampled_indices_relative = torch.randperm(num_available, device=device)[:num_to_sample]; sampled_indices_absolute = available_indices[sampled_indices_relative]
+    mask = torch.zeros((1, total_patches), dtype=torch.bool, device=device); mask.scatter_(1, sampled_indices_absolute.unsqueeze(0), True)
+    return mask
+
+def generate_masks(input_shape=(30, 30), patch_size=3, num_mask_sets=5, device='cpu', context_min_scale=0.25, context_max_scale=0.75, num_targets_per_context=4, target_min_scale=0.05, target_max_scale=0.10):
+    """Generates lists of context and target masks for I-JEPA training."""
+    # ... (implementation from previous step remains unchanged) ...
+    if isinstance(device, str): device = torch.device(device)
+    num_patches_h = input_shape[0] // patch_size; num_patches_w = input_shape[1] // patch_size; total_patches = num_patches_h * num_patches_w
+    if total_patches == 0: raise ValueError(f"Input shape {input_shape} too small for patch size {patch_size}.")
+    all_context_masks = []; all_target_masks = []
+    for i_set in range(num_mask_sets):
+        context_mask = _get_random_rectangular_block_mask(num_patches_h, num_patches_w, context_min_scale, context_max_scale, device)
+        if context_mask is None: continue
+        available_for_target = ~context_mask; num_targets_generated = 0
+        for i_target in range(num_targets_per_context):
+            target_mask = _get_random_patch_sampling_mask(total_patches, target_min_scale, target_max_scale, device, available_for_target)
+            if target_mask is None: continue
+            if not target_mask.any(): continue
+            all_context_masks.append(context_mask.clone()); all_target_masks.append(target_mask); num_targets_generated += 1
+            available_for_target &= ~target_mask
+    if not all_context_masks: return [], []
+    return all_context_masks, all_target_masks
+
+
+# --- Grid Utility Functions ---
+
+def grid_to_tensor(grid, target_size=(30, 30), pad_value=10):
+    """
+    Pads/truncates grid to target_size and converts to tensor.
+    Maps colors 0-9 to indices 0-9, and other values (padding) to pad_value index.
+    """
+    # ... (implementation from previous step remains unchanged) ...
+    try:
+        grid_np = np.array(grid, dtype=np.int64); h, w = grid_np.shape; th, tw = target_size
+        tensor = torch.full(target_size, pad_value, dtype=torch.long); copy_h = min(h, th); copy_w = min(w, tw)
+        source_subgrid = torch.from_numpy(grid_np[:copy_h, :copy_w]); valid_mask = (source_subgrid >= 0) & (source_subgrid <= 9)
+        tensor[:copy_h, :copy_w][valid_mask] = source_subgrid[valid_mask]
+        return tensor
+    except Exception as e: print(f"ERROR in grid_to_tensor: {e}"); return None
+
+def tensor_to_grid(tensor):
+    """
+    Converts output tensor back to ARC grid format (list of lists).
+    Basic placeholder - assumes tensor contains final grid indices 0-9.
+    """
+    # ... (implementation from previous step remains unchanged) ...
+    try:
+        if tensor.dim() > 2: tensor = tensor.squeeze()
+        grid_np = tensor.cpu().int().numpy()
+        return grid_np.tolist()
+    except Exception as e: print(f"ERROR in tensor_to_grid: {e}"); return [[0]]
+
