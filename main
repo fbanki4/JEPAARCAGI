@@ -1,0 +1,302 @@
+# main.py
+
+import json
+import os
+import numpy as np
+from pathlib import Path
+import copy
+import time # For timing if needed
+
+# ML Imports
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+
+# --- Import custom modules ---
+from i_jepa_module import IJEPA
+# Keep grid utils needed by solver and adaptation phase
+from arc_utils import generate_masks, grid_to_tensor, tensor_to_grid
+# Import the UPDATED solver that works in representation space
+from solver_module import ARCSolver
+
+# --- Configuration ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+# --- IJEPA Model Hyperparameters ---
+MODEL_PARAMS = {
+    "input_size": (30, 30), # Fixed input size model expects
+    "patch_size": 3,
+    "num_colors": 11, # 0-9 colors + 1 padding value (index 10)
+    "embed_dim": 256,
+    "color_embed_dim": 64,
+    "encoder_depth": 6,
+    "encoder_num_heads": 4,
+    "predictor_embed_dim": 256,
+    "predictor_depth": 3,
+    "predictor_num_heads": 4,
+    "use_pos_embed": True
+}
+
+# --- IJEPA Training Hyperparameters ---
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 0.05
+ADAPTATION_EPOCHS = 50 # Number of epochs for task-specific adaptation
+GRAD_CLIP_NORM = 1.0
+
+# --- IJEPA Masking Hyperparameters ---
+MASK_PARAMS = {
+    "num_mask_sets": 5,
+    "context_min_scale": 0.25,
+    "context_max_scale": 0.75,
+    "num_targets_per_context": 4,
+    "target_min_scale": 0.05,
+    "target_max_scale": 0.10,
+}
+
+# --- Control Flags ---
+# Set to True to run the IJEPA self-supervised training on the task examples
+# before using the features in the solver. Recommended.
+RUN_IJEPA_ADAPTATION = True
+
+# --- Main Submission Function ---
+def solve(task):
+    """
+    Solves a single ARC task using an optional I-JEPA adaptation phase
+    followed by a Nearest Neighbor Solver operating in the learned representation space.
+    """
+    print(f"\n--- Solving Task ---")
+    task_start_time = time.time()
+    predictions = []
+    # Define fixed shape and padding value used for tensor conversion
+    fixed_input_shape = MODEL_PARAMS["input_size"]
+    pad_value = 10 # Corresponds to num_colors=11 in MODEL_PARAMS
+
+    # --- Initialize IJEPA Model ---
+    # This model is needed by the solver, so initialize it regardless of adaptation phase
+    i_jepa_model = None # Ensure it's defined in this scope
+    try:
+        i_jepa_model = IJEPA(**MODEL_PARAMS).to(DEVICE)
+        print(f"IJEPA Model Initialized.")
+        # *** Optional: Load pre-trained IJEPA weights here if available ***
+        # Example:
+        # ijepa_weights_path = "ijepa_pretrained_weights.pth"
+        # try:
+        #    i_jepa_model.load_state_dict(torch.load(ijepa_weights_path, map_location=DEVICE))
+        #    print(f"Loaded pre-trained IJEPA weights from {ijepa_weights_path}.")
+        # except FileNotFoundError:
+        #    print(f"IJEPA weights '{ijepa_weights_path}' not found, using random init.")
+        # except Exception as e:
+        #    print(f"ERROR loading IJEPA weights: {e}. Using random init.")
+
+    except Exception as e:
+        print(f"ERROR Initializing IJEPA model: {e}. Cannot proceed.")
+        # Return fallback predictions for all test cases if model init fails
+        return [copy.deepcopy(t['input']) for t in task['test']]
+
+    # --- Optional: I-JEPA Adaptation Phase ---
+    if RUN_IJEPA_ADAPTATION:
+        print("--- IJEPA Adaptation Phase Enabled ---")
+        adaptation_start_time = time.time()
+        try:
+            # Initialize Optimizer for adaptation
+            optimizer = optim.AdamW(i_jepa_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+            print(f"  Optimizer Initialized for Adaptation.")
+
+            # Prepare Training Data (Tensors for IJEPA)
+            processed_train_tensors = []
+            print(f"  Processing training examples into tensors for adaptation...")
+            for i, pair in enumerate(task['train']):
+                input_tensor = grid_to_tensor(pair['input'], target_size=fixed_input_shape, pad_value=pad_value)
+                if input_tensor is None:
+                    print(f"  WARNING: Failed to convert training input {i} to tensor. Skipping for adaptation.")
+                    continue
+                processed_train_tensors.append({'input_tensor': input_tensor}) # Store tensor
+
+            if not processed_train_tensors:
+                print("  ERROR: No valid training examples for adaptation. Skipping adaptation phase.")
+            else:
+                # Run Adaptation Loop
+                print(f"  Starting Task-Specific Adaptation ({ADAPTATION_EPOCHS} Epochs)...")
+                i_jepa_model.train() # Set model to training mode
+                for epoch in range(ADAPTATION_EPOCHS):
+                    epoch_loss = 0.0
+                    num_samples_processed_this_epoch = 0
+                    # Iterate through prepared tensors
+                    for train_data in processed_train_tensors:
+                        try:
+                            input_tensor = train_data['input_tensor'].to(DEVICE).unsqueeze(0) # Add batch dim B=1
+                            # Generate masks for this input
+                            context_masks, target_masks = generate_masks(
+                                input_shape=fixed_input_shape,
+                                patch_size=MODEL_PARAMS["patch_size"],
+                                device=DEVICE,
+                                **MASK_PARAMS
+                            )
+                            # Skip if mask generation failed
+                            if not context_masks: continue
+
+                            # Forward pass to calculate I-JEPA loss
+                            loss, loss_info = i_jepa_model.forward_loss(
+                                input_tensor, context_masks, target_masks
+                            )
+
+                            # Backward pass and optimization step only if loss requires grad
+                            if loss.requires_grad:
+                                optimizer.zero_grad()
+                                loss.backward()
+                                # Optional: Gradient Clipping
+                                if GRAD_CLIP_NORM > 0:
+                                    torch.nn.utils.clip_grad_norm_(i_jepa_model.parameters(), GRAD_CLIP_NORM)
+                                optimizer.step()
+                                epoch_loss += loss.item()
+
+                            num_samples_processed_this_epoch += 1
+                        except Exception as e:
+                            # Log error but continue epoch/training for robustness
+                            print(f"  ERROR during adaptation step (Epoch {epoch+1}): {e}")
+                            if 'optimizer' in locals(): optimizer.zero_grad() # Clear potentially bad grads
+
+                    # Log epoch loss
+                    avg_loss = epoch_loss / num_samples_processed_this_epoch if num_samples_processed_this_epoch > 0 else 0
+                    # Log less frequently to reduce output noise
+                    if (epoch + 1) % 25 == 0 or epoch == 0 or epoch == ADAPTATION_EPOCHS -1 :
+                         print(f"    Adaptation Epoch [{epoch+1}/{ADAPTATION_EPOCHS}], Avg Loss: {avg_loss:.4f}")
+
+                print("  --- Adaptation Finished ---")
+                if i_jepa_model: i_jepa_model.eval() # Set adapted model to eval mode
+
+        except Exception as e:
+            # Catch errors during the entire adaptation phase
+            print(f"ERROR during IJEPA Adaptation Phase: {e}. Proceeding without adaptation.")
+            if i_jepa_model: i_jepa_model.eval() # Ensure model is in eval mode even if adaptation failed mid-way
+
+        adaptation_duration = time.time() - adaptation_start_time
+        print(f"--- IJEPA Adaptation Phase took {adaptation_duration:.2f} seconds ---")
+    else:
+        print("--- IJEPA Adaptation Phase Skipped ---")
+        if i_jepa_model: i_jepa_model.eval() # Ensure model is in eval mode if adaptation skipped
+
+
+    # --- Initialize and Use Representation Space Solver ---
+    print("--- Representation Space Solver Phase ---")
+    solver_start_time = time.time()
+    # Prepare training pairs with original grids (needed by solver's find_transformation)
+    train_pairs_for_solver = []
+    print(f"  Processing training examples for solver...")
+    for i, pair in enumerate(task['train']):
+        # Solver expects original list-of-lists or numpy arrays
+        train_pairs_for_solver.append({'input': pair['input'], 'output': pair['output']})
+
+    if not train_pairs_for_solver:
+         print(f"  ERROR: No valid train pairs for solver. Cannot find transformation.")
+         # Fallback: predict input for all test cases
+         return [copy.deepcopy(t['input']) for t in task['test']]
+
+    # Initialize and run the solver's preparation step (feature extraction)
+    try:
+        # Initialize the Representation Space Solver, passing the IJEPA model
+        arc_solver = ARCSolver(
+            i_jepa_model=i_jepa_model,
+            device=DEVICE,
+            target_size=fixed_input_shape,
+            pad_value=pad_value
+        )
+        # Pre-compute features for training examples
+        arc_solver.find_transformation(train_pairs_for_solver)
+    except Exception as e:
+        # Catch errors during solver initialization or preparation
+        print(f"  ERROR initializing or preparing solver: {e}. Cannot generate predictions.")
+        return [copy.deepcopy(t['input']) for t in task['test']] # Fallback
+
+    solver_duration = time.time() - solver_start_time
+    print(f"--- Solver Preparation took {solver_duration:.2f} seconds ---")
+
+
+    # --- Generate Predictions for Test Inputs using the Solver ---
+    print("--- Generating Test Predictions using Representation Space Solver ---")
+    prediction_start_time = time.time()
+    for i, test_example in enumerate(task['test']):
+        predicted_grid_list = None # Initialize prediction for this test case
+        try:
+            test_input_grid = test_example['input'] # Original grid format
+            # Solver takes original grid, handles feature extraction and decoding
+            predicted_grid_list = arc_solver.apply_transformation(test_input_grid) # Returns list
+
+            # --- Sanity Check Output Format ---
+            if not isinstance(predicted_grid_list, list) or \
+               (predicted_grid_list and not all(isinstance(row, list) for row in predicted_grid_list)):
+                 print(f"  WARNING: Prediction format incorrect for test case {i}. Got {type(predicted_grid_list)}. Resetting to input.")
+                 predicted_grid_list = copy.deepcopy(test_example['input']) # Fallback
+
+        except Exception as e:
+            # Catch errors during the prediction step for a single test case
+            print(f"  ERROR during prediction for test case {i}: {e}. Falling back.")
+            # Fallback to input grid if any error occurs during prediction
+            predicted_grid_list = copy.deepcopy(test_example['input'])
+
+        # Append the final prediction (or fallback)
+        predictions.append(predicted_grid_list)
+
+    prediction_duration = time.time() - prediction_start_time
+    print(f"--- Prediction Generation took {prediction_duration:.2f} seconds ---")
+
+    total_duration = time.time() - task_start_time
+    print(f"--- Task Solved (Representation Space Attempt), Total Time: {total_duration:.2f} seconds ---")
+    print(f"--- Returning {len(predictions)} Predictions ---")
+    return predictions
+
+
+# --- Example Usage (Optional: for testing this file directly) ---
+if __name__ == '__main__':
+    # Dummy task for basic testing
+    dummy_task = {
+        "train": [
+            {"input": [[1, 0], [0, 0]], "output": [[0, 1], [0, 0]]},
+            {"input": [[0, 0], [0, 2]], "output": [[0, 0], [2, 0]]}
+        ],
+        "test": [
+            {"input": [[3, 0], [0, 0]], "output": []},
+             {"input": [[0, 4], [4, 0]], "output": []}
+        ]
+    }
+
+    # --- Load task from file example ---
+    # task_dir = Path("./data/training") # Adjust path to ARC dataset
+    # task_file = task_dir / "0a0b1c2d.json" # Example file
+    # try:
+    #     with open(task_file, 'r') as f:
+    #         print(f"Loading task from {task_file}")
+    #         dummy_task = json.load(f)
+    # except FileNotFoundError:
+    #     print(f"Task file {task_file} not found, using inline dummy task.")
+    # except Exception as e:
+    #      print(f"Error loading task file {task_file}: {e}. Using inline dummy task.")
+
+
+    print("\n>>> Running solve() with Representation Space Solver on dummy task <<<")
+    # You can control the adaptation phase using the flag at the top of the script
+    # RUN_IJEPA_ADAPTATION = True # Or False
+
+    test_predictions = solve(dummy_task)
+
+    # Print the predictions
+    print("\n--- Generated Predictions (Representation Space Solver): ---")
+    for i, pred in enumerate(test_predictions):
+        print(f"Test Case {i}:")
+        if isinstance(pred, list):
+            if pred:
+                # Try to find max length for alignment, handle non-numeric gracefully
+                try:
+                    max_len = max(len(str(cell)) for row in pred for cell in row) if pred else 1
+                except Exception:
+                    max_len = 1 # Fallback alignment
+                for row in pred:
+                    # Ensure cells are strings for join
+                    print(" ".join(f"{str(cell):{max_len}}" for cell in row))
+            else:
+                print("[]") # Empty grid
+        else:
+            print(pred) # Print if format is unexpected
+        print("-" * 10)
+
